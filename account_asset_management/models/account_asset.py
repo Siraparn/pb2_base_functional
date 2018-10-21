@@ -1,17 +1,19 @@
 # -*- coding: utf-8 -*-
 # Copyright 2009-2017 Noviat
 # License AGPL-3.0 or later (http://www.gnu.org/licenses/agpl).
-
+import time
+import uuid
+import csv
+import cStringIO
 import calendar
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
 import logging
 from sys import exc_info
 from traceback import format_exception
-
 from openerp import api, fields, models, _
 from openerp.addons.decimal_precision import decimal_precision as dp
-from openerp.exceptions import Warning as UserError
+from openerp.exceptions import Warning as UserError, ValidationError
 
 _logger = logging.getLogger(__name__)
 
@@ -231,6 +233,27 @@ class AccountAsset(models.Model):
                 asset.depreciation_base = \
                     asset.purchase_value - asset.salvage_value
 
+    # PERFORMANCE TUNING - DO NOT DELETE
+    # @api.multi
+    # @api.depends('depreciation_base',
+    #              'depreciation_line_ids.amount',
+    #              'depreciation_line_ids.previous_id',
+    #              'depreciation_line_ids.init_entry',
+    #              'depreciation_line_ids.move_id')
+    # def _compute_depreciation(self):
+    #     for asset in self:
+    #         if asset.type == 'normal':
+    #             lines = asset.depreciation_line_ids.filtered(
+    #                 lambda l: l.type in ('depreciate', 'remove') and
+    #                 (l.init_entry or l.move_check))
+    #             value_depreciated = sum([l.amount for l in lines])
+    #             asset.value_residual = \
+    #                 asset.depreciation_base - value_depreciated
+    #             asset.value_depreciated = value_depreciated
+    #         else:
+    #             asset.value_residual = 0.0
+    #             asset.value_depreciated = 0.0
+
     @api.multi
     @api.depends('depreciation_base',
                  'depreciation_line_ids.amount',
@@ -238,18 +261,41 @@ class AccountAsset(models.Model):
                  'depreciation_line_ids.init_entry',
                  'depreciation_line_ids.move_id')
     def _compute_depreciation(self):
-        for asset in self:
-            if asset.type == 'normal':
-                lines = asset.depreciation_line_ids.filtered(
-                    lambda l: l.type in ('depreciate', 'remove') and
-                    (l.init_entry or l.move_check))
-                value_depreciated = sum([l.amount for l in lines])
-                asset.value_residual = \
-                    asset.depreciation_base - value_depreciated
-                asset.value_depreciated = value_depreciated
-            else:
-                asset.value_residual = 0.0
-                asset.value_depreciated = 0.0
+        asset_dict = {}
+        asset_ids = self.ids
+        if asset_ids:
+            self._cr.execute("""
+            -- update account_asset
+            -- set value_depreciated = c.value_depreciated,
+            -- value_residual = c.value_residual
+            -- from (  -- Attempt to update directly via sql, but not work yet
+            select a.id asset_id,
+                coalesce(b.value_depreciated, 0.0) value_depreciated,
+                coalesce(b.value_residual,
+                    case when a.type = 'view' then 0.0
+                    when a.method in ('linear-limit', 'degr-limit')
+                        then a.purchase_value
+                        else a.purchase_value - a.salvage_value end
+                    ) value_residual
+            from account_asset a left outer join (
+                select l.asset_id, sum(l.amount) value_depreciated,
+                    a.depreciation_base - sum(l.amount) value_residual
+                from account_asset a
+                    join account_asset_line l on a.id = l.asset_id
+                where a.type = 'normal'
+                and l.type in ('depreciate', 'remove')
+                and (l.init_entry = true or l.move_check = true)
+                and a.id in %s
+                group by l.asset_id, a.depreciation_base
+            ) b on a.id = b.asset_id where a.id in %s
+            -- ) c where id = c.asset_id
+            """, (tuple(asset_ids), tuple(asset_ids)))
+            for x in self._cr.fetchall():
+                asset_dict[x[0]] = (x[1], x[2])
+            for asset in self:
+                asset.value_depreciated = asset_dict.get(asset.id)[0]
+                asset.value_residual = asset_dict.get(asset.id)[1]
+        return True
 
     @api.multi
     @api.constrains('parent_id')
@@ -447,6 +493,9 @@ class AccountAsset(models.Model):
 
     @api.multi
     def compute_depreciation_board(self):
+        # RECOMPUTE
+        self = self.with_context(recompute=False)
+        # --
         line_obj = self.env['account.asset.line']
         digits = self.env['decimal.precision'].precision_get('Account')
 
@@ -583,7 +632,9 @@ class AccountAsset(models.Model):
                     else:
                         seq -= 1
                 line_i_start = 0
-
+        # RECOMPUTE
+        self.recompute()
+        # --
         return True
 
     def _get_fy_duration(self, fy_id, option='days'):
@@ -908,7 +959,7 @@ class AccountAsset(models.Model):
                 init_flag = True
             fy_date_start = datetime.strptime(fy.date_start, '%Y-%m-%d')
             fy_date_stop = datetime.strptime(fy.date_stop, '%Y-%m-%d')
-        except:
+        except Exception:
             # The following logic is used when no fiscal year
             # is defined for the asset start date:
             # - We lookup the first fiscal year defined in the system
@@ -955,7 +1006,7 @@ class AccountAsset(models.Model):
             try:
                 fy_id = fy_obj.find(fy_date_start)
                 init_flag = False
-            except:
+            except Exception:
                 fy_id = False
             if fy_id and self.method_period == 'year':
                 fy = fy_obj.browse(fy_id)
@@ -1038,11 +1089,40 @@ class AccountAsset(models.Model):
         return (self.code or str(self.id)) + '/' + str(seq)
 
     @api.multi
-    def _compute_entries(self, period, check_triggers=False):
-        # To DO : add ir_cron job calling this method to
-        # generate periodical accounting entries
+    def _test_prev_depre_unposted(self, period):
+        """ Refactor code by kittiu, so this method can be reused
+            also works with multiple assets (will return list of assets) """
+        self._cr.execute("""
+            select asset_id
+            from account_asset_line
+            where asset_id in %s
+                and type = 'depreciate'
+                and init_entry = false
+                and line_date < %s
+                and move_check = false
+        """, (tuple(self.ids), period.date_start))
+        # asset_line_obj = self.env['account.asset.line']
+        # depreciations = asset_line_obj.search([
+        #     ('asset_id', '=', asset.id),
+        #     ('type', '=', 'depreciate'),
+        #     ('init_entry', '=', False),
+        #     ('line_date', '<', period.date_start),
+        #     ('move_check', '=', False)])
+        unposted_asset_ids = [x[0] for x in self._cr.fetchall()]
+        return unposted_asset_ids
+        # if depreciations:
+        #     message = _("Asset contains unposted lines "
+        #                 "prior to the selected period. "
+        #                 "Please post those entries first!")
+        #     return (False, message)  # Error
+        # return (True, False)
+
+    @api.multi
+    def _compute_entries(self, period, check_triggers=False,
+                         merge_move=False, merge_date=False,
+                         fast_create_move=False):
         result = []
-        error_log = ''
+        error_log = []
         asset_line_obj = self.env['account.asset.line']
         if check_triggers:
             recompute_obj = self.env['account.asset.recompute.trigger']
@@ -1052,45 +1132,105 @@ class AccountAsset(models.Model):
             for asset in self:
                 if asset.company_id.id in trigger_companies.ids:
                     asset.compute_depreciation_board()
-        for asset in self:
-            depreciations = asset_line_obj.search([
-                ('asset_id', '=', asset.id),
-                ('type', '=', 'depreciate'),
-                ('init_entry', '=', False),
-                ('line_date', '<', period.date_start),
-                ('move_check', '=', False)])
-            if depreciations:
-                asset_ref = asset.code and '%s (ref: %s)' \
-                    % (asset.name, asset.code) or asset.name
-                raise UserError(
-                    _("Asset '%s' contains unposted lines "
-                      "prior to the selected period."
-                      "\nPlease post these entries first !") % asset_ref)
 
-        depreciations = asset_line_obj.search([
-            ('asset_id', 'in', self.ids),
-            ('type', '=', 'depreciate'),
-            ('init_entry', '=', False),
-            ('line_date', '<=', period.date_stop),
-            ('line_date', '>=', period.date_start),
-            ('move_check', '=', False)])
-        for depreciation in depreciations:
+        # Return asset_ids with prev depre problem
+        unposted_asset_ids = self._test_prev_depre_unposted(period)
+        if unposted_asset_ids:
+            messsage = _("Asset(s) contains unposted lines "
+                         "prior to the selected period. "
+                         "Please post those entries first!")
+            raise UserError(messsage)
+        # depreciations = asset_line_obj.search([
+        #     ('asset_id', 'in', self.ids),
+        #     ('type', '=', 'depreciate'),
+        #     ('init_entry', '=', False),
+        #     ('line_date', '<=', period.date_stop),
+        #     ('line_date', '>=', period.date_start),
+        #     ('move_check', '=', False)], limit=1000)
+        depreciations_ids = []
+        asset_ids = self.ids
+        if asset_ids:
+            self._cr.execute("""
+                select id from account_asset_line asl
+                where exists (
+                    select 1 from account_asset
+                    where id = asl.asset_id and id in %s)
+                and type = 'depreciate' and init_entry = false
+                and line_date <= %s and line_date >= %s and move_check = false
+            """, (tuple(asset_ids), period.date_stop, period.date_start))
+            depreciations_ids = [x[0] for x in self._cr.fetchall()]
+        depreciations = asset_line_obj.browse(depreciations_ids)
+        # Prepare move_dicts for fast_create_move, which will use bulk import
+        if merge_move and fast_create_move:
+            raise ValidationError(
+                _('Currently, fast_create_move not applicable for merge_move'))
+        # Special case merge into 1 move
+        if merge_move:
+            _logger.info("Generate merged move for %s depre." %
+                         len(depreciations_ids))
             try:
+                # for merge case, use specified date
                 with self._cr.savepoint():
-                    result += depreciation.create_move()
-            except:
+                    result += depreciations.create_single_move(merge_date)
+            except Exception:
                 e = exc_info()[0]
                 tb = ''.join(format_exception(*exc_info()))
-                asset_ref = depreciation.asset_id.code and '%s (ref: %s)' \
-                    % (asset.name, asset.code) or asset.name
-                error_log += _(
-                    "\nError while processing asset '%s': %s"
-                ) % (asset_ref, str(e))
+                error_log.append(
+                    _("Error while processing deprs. '%s': %s") %
+                     (depreciations, str(e)))
                 error_msg = _(
-                    "Error while processing asset '%s': \n\n%s"
-                ) % (asset_ref, tb)
+                    "Error while processing depre. '%s': \n\n%s"
+                ) % (depreciations, tb)
                 _logger.error("%s, %s", self._name, error_msg)
-
+        else:  # Standard
+            if fast_create_move:
+                _logger.info("Begin fast create move for %s depre." %
+                             len(depreciations_ids))
+                try:
+                    _logger.info("Begin create_move() for %s depre." %
+                                 len(depreciations_ids))
+                    # create_move will return only dict
+                    s = time.time()
+                    move_dict, move_line_dict = depreciations.\
+                        create_move(return_as_dict=fast_create_move)
+                    _logger.info("Begin create_move() in %s secs." %
+                                 (time.time()-s))
+                    _logger.info("Begin _fast_create_move()")
+                    # Create moves, without ORM
+                    s = time.time()
+                    result += self._fast_create_move(move_dict,
+                                                     move_line_dict)
+                    _logger.info("End _fast_create_move() in %s secs." %
+                                 (time.time()-s))
+                    # NOTE: for fast create move, folloiwng 2 methods is not
+                    # called yet. It will be called by batch document, as
+                    # it won't be linked or marked account_asset_line yet.
+                    # --
+                    # self._compute_depreciation()
+                    # self._set_close_asset_zero_value()
+                except Exception:
+                    error_msg = _("Error while processing fast asset compute")
+                    _logger.error("%s, %s", self._name, error_msg)
+            else:
+                for depreciation in depreciations:
+                    asset = depreciation.asset_id
+                    _logger.info("Generate depres. for asset: %s" % asset.code)
+                    try:
+                        with self._cr.savepoint():
+                            result += depreciation.create_move()
+                    except Exception:
+                        e = exc_info()[0]
+                        tb = ''.join(format_exception(*exc_info()))
+                        asset_ref = depreciation.asset_id.code and \
+                            '%s (ref: %s)' % (asset.name, asset.code) or \
+                            asset.name
+                        error_log.append(
+                            _("Error while processing asset '%s': %s") %
+                             (asset_ref, str(e)))
+                        error_msg = _(
+                            "Error while processing asset '%s': \n\n%s"
+                        ) % (asset_ref, tb)
+                        _logger.error("%s, %s", self._name, error_msg)
         if check_triggers and recomputes:
             companies = recomputes.mapped('company_id')
             triggers = recomputes.filtered(
@@ -1101,5 +1241,99 @@ class AccountAsset(models.Model):
                     'state': 'done',
                 }
                 triggers.sudo().write(recompute_vals)
-
+        error_log = '\n'.join(error_log)
         return (result, error_log)
+
+    @api.model
+    def _fast_create_move(self, move_dict, move_line_dict):
+        """ Create journal entry using direct database injection """
+        if not move_dict:
+            return []
+        group_uuid = unicode(uuid.uuid4())  # TO group new account.move
+        extend_tables = self._get_extend_columns_for_fast_create(group_uuid)
+        group_move_id = False  # All new account.move.line, groupd by this id
+        for table_name, data_dict in [('account_move', move_dict),
+                                      ('account_move_line', move_line_dict)]:
+
+            data_list = []
+            columns = ''
+            extend_cols = extend_tables[table_name]
+            depre_line_id = False
+            for depre_line_id, values in data_dict.iteritems():
+                if not data_list:  # First line, use column name
+                    header = []
+                    for value in values:
+                        header += value.keys()
+                    header = list(set(header))
+                    header_extend = header + extend_cols.keys()
+                    columns = ','.join(header_extend)
+                    data_list.append(header_extend)
+                for value in values:
+                    value.update({'ref': str(depre_line_id)})
+                    # To avoid error, we need to fix some move_id
+                    # Then, we will reset it later
+                    if 'move_id' in value and group_move_id:
+                        value['move_id'] = group_move_id
+                    row = []
+                    for col in header:
+                        val = value.get(col, False)
+                        if '_id' in col and not val:
+                            val = ''
+                        row.append(val)
+                    for k in extend_cols.keys():
+                        v = extend_cols[k]
+                        # Special value
+                        if v == 'value.date':
+                            v = value['date']
+                        row.append(v)
+                    data_list.append(row)
+            # TO CSV
+            data_csv = cStringIO.StringIO()
+            csv_writer = csv.writer(data_csv, delimiter=',', quotechar='"',
+                                    quoting=csv.QUOTE_MINIMAL)
+            if data_list:
+                csv_writer.writerows(data_list)
+            else:
+                return False
+            data_csv.seek(0)
+            s = time.time()
+            self._cr.copy_expert("copy %s (%s) from STDIN CSV HEADER" %
+                                 (table_name, columns), data_csv)
+            _logger.info("Done insert %s rows into table %s in %s secs." %
+                         (len(data_list), table_name, (time.time()-s)))
+            # Find latest move_id, to use temporarilly
+            if table_name == 'account_move':
+                self._cr.execute("""
+                    select max(id) from account_move where ref = %s
+                """, (str(depre_line_id), ))
+                group_move_id = self._cr.fetchone()[0]
+        self._cr.commit()  # must commit, otherwise it will lock table
+        # After done all the record creation, now link line and move
+        s = time.time()
+        self._cr.execute("""
+            update account_move_line aml set move_id = (
+                select id from account_move where ref = aml.ref
+                and narration = %s)
+            where aml.move_id = %s
+        """, (group_uuid, group_move_id))
+        _logger.info("Done linking move and move_line in %s secs." %
+                     (time.time()-s))
+        # All move_ids
+        self._cr.execute("""
+            select id from account_move where narration = %s
+        """, (group_uuid, ))
+        move_ids = [x[0] for x in self._cr.fetchall()]
+        return move_ids
+
+    @api.model
+    def _get_extend_columns_for_fast_create(self):
+        """ Add more columns in order to create record """
+        return {}
+
+    @api.multi
+    def _set_close_asset_zero_value(self):
+        # we re-evaluate the assets to determine if we can close them
+        for asset in self:
+            if asset.company_id.currency_id.is_zero(asset.value_residual):
+                asset.state = 'close'
+        return True

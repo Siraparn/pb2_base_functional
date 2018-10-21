@@ -32,7 +32,7 @@
                 <xpath expr="//sheet/group" position="before">
                     <h1>
                         <label string="Expense "/>
-                        <field name="number" class="oe_inline"/>
+                        <field name="number" readonly="1" class="oe_inline"/>
                     </h1>
                 </xpath>
             </field>

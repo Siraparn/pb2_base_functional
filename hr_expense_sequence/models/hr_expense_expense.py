@@ -9,7 +9,16 @@ from openerp import models, fields, api
 class HrExpense(models.Model):
     _inherit = 'hr.expense.expense'
 
-    number = fields.Char(required=True, default="/", readonly=True, copy=False)
+    number = fields.Char(
+        string='Number',
+        required=True,
+        default="/",
+        readonly=False,
+        copy=False,
+    )
+    _sql_constraints = [
+        ('number_uniq', 'unique(number)', 'Number must be unique!'),
+    ]
 
     @api.model
     def create(self, vals):
